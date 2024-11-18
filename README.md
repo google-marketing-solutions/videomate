@@ -71,7 +71,7 @@ To combine internal data assets and external-friendly models, APIs and infrastru
 
 
 
-* **Input Videos - **Users are to prepare the input videos to add voice over. Videos with or without original vocal dubbing are both supported. Input videos are supported to be uploaded to the conventional path and folder within Google Cloud Storage (GCS), by default in .mp4 extension, and specify the GCS bucket, folder and object name; or to be uploaded to YouTube and specify the URL.
+* **Input Videos** - Users are to prepare the input videos to add voice over. Videos with or without original vocal dubbing are both supported. Input videos are supported to be uploaded to the conventional path and folder within Google Cloud Storage (GCS), by default in .mp4 extension, and specify the GCS bucket, folder and object name; or to be uploaded to YouTube and specify the URL.
 * **[Gemini 1.5 Pro](https://cloud.google.com/vertex-ai/generative-ai/docs/model-garden/explore-models)** - Google's next-generation large language model, representing a significant step forward in AI capabilities. Using  Gemini 1.5 Pro to execute multiple tasks including: 1) Video content understanding, 2) Voice over script generation, 3) SSML generation.
 * **[Cloud Text-to-Speech API](https://cloud.google.com/text-to-speech?hl=en#demo)** - A service that leverages advanced AI and machine learning models to convert written text into natural-sounding spoken audio. Using Cloud TTS API to convert the script/SSML into natural-sounding speech.
 * **[FFmpeg](https://www.ffmpeg.org/)** - A powerful and versatile open-source multimedia framework. It's a collection of libraries and tools that can handle virtually any task related to audio, video, and other multimedia formats. Using FFmpeg to synthesize the voiceover with the original video with volume balancing and speed optimization.
@@ -318,7 +318,7 @@ Make sure the user running the installation has the following permissions.
 
 ##### 1.4 Enable Required APIs
 
-Go to [Vertex AI console](https://pantheon.corp.google.com/vertex-ai), Click **Enable All Recommended APIs** in the Vertex AI dashboard.
+Go to [Vertex AI console(https://console.cloud.google.com/vertex-ai), Click **Enable All Recommended APIs** in the Vertex AI dashboard.
 
 It might take a few moments for the enabling process to complete. A blue ring circling the bell icon appears in the upper right of the Google Cloud console as the APIs are being enabled.
 
@@ -545,13 +545,13 @@ Throughput: 60 - 1000 /hr depending on how much resource we use
 
 * The original video is 90 seconds and the edited video is 15 seconds.
 
-**Video Understanding **
+**Video Understanding**
 
 
 
 * Gemini 1.5 Pro: 105 seconds of video, about $0.17
 
-**Speech Generation **
+**Speech Generation**
 
 
 
