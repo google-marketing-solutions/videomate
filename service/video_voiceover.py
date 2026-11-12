@@ -19,6 +19,7 @@ import datetime
 import logging
 import os
 import random
+import re
 import shutil
 import string
 import subprocess
@@ -29,7 +30,6 @@ import librosa
 from vertexai.generative_models import SafetySetting
 import voiceover_config
 import voiceover_utils
-
 
 logging.basicConfig(
     format=(
@@ -44,6 +44,16 @@ _MAX_SPEED_ADJUST = 1.2
 _RANDOM_STRING_LENGTH = 12
 _MAX_DELAY_IN_MILLISECONDS = 800
 _MILLISECONDS_IN_SECOND = 1000
+_SAFE_EXTENSION_RE = re.compile(r'^[A-Za-z0-9]{1,10}$')
+
+
+def _extract_safe_extension(file_path: str) -> str:
+  """Extracts a validated alphanumeric file extension from a media path."""
+  _, ext = os.path.splitext(os.path.basename(file_path))
+  ext = ext.lstrip('.')
+  if not _SAFE_EXTENSION_RE.fullmatch(ext):
+    raise ValueError(f'Invalid media file extension in path: {file_path!r}')
+  return ext
 
 
 @dataclasses.dataclass
@@ -57,10 +67,10 @@ class VideoVoiceover:
     video_length: The duration of the video in seconds.
     ssml_gender: Specifying gender in SSML
     download_path: The local directory where the video is downloaded.
-    audio_path: The local path to the audio file extracted or generated
-                from the video.
-    output_path: The local directory where the final output video with
-                 voiceover is saved.
+    audio_path: The local path to the audio file extracted or generated from the
+      video.
+    output_path: The local directory where the final output video with voiceover
+      is saved.
     input_path: The local path to the original video file.
     direct_script: A pre-written script for the voiceover.
     gemini_pro_model: An instance of the Gemini Pro language model.
@@ -74,18 +84,19 @@ class VideoVoiceover:
     language_full_name: Target full language name of the voiceover.
     voice_id: Target voice id of the voiceover.
     voice_gender: The gender of the synthetic voice.
-    original_video_has_vocal_dubbing: Indicates if the original video
-                                      already has a dubbed voiceover.
+    original_video_has_vocal_dubbing: Indicates if the original video already
+      has a dubbed voiceover.
     voiceover_script_context_prompt: A prompt provided to Gemini Pro to generate
-                                     the voiceover script.
+      the voiceover script.
     tmp_path: A temporary directory for intermediate files.
     gcs_bucket_name: The name of a Google Cloud Storage bucket.
     gcs_top_level_folder: The top-level folder within the GCS bucket.
     tmp_table_id: The ID of a temporary table in BigQuery.
     err_msg: An optional string to store error messages.
-    max_retry_count: The maximum number of times to retry an operation
-                     (defaults to 3).
+    max_retry_count: The maximum number of times to retry an operation (defaults
+      to 3).
   """
+
   gemini_pro_model: any
   tts_client: any
   gcs_client: any
@@ -355,7 +366,7 @@ class VideoVoiceover:
 
     Args:
       status: The status of the video processing (e.g., "GENERATE_SUCCESS",
-              "GENERATE_FAILED").
+        "GENERATE_FAILED").
       err_msg: An optional error message if the processing failed.
     """
     file_location = f'gs://{self.gcs_bucket_name}/{self.output_path}/{self._get_generated_video_file_name()}'
@@ -394,19 +405,40 @@ class VideoVoiceover:
       new_status: The new status to set for the video in the table.
 
     Raises:
+      ValueError: If `tmp_table_id` is not a valid BigQuery table identifier.
       Exception: If any error occurs during the BigQuery update operation.
     """
     project_id = voiceover_config.GCP_PROJECT_ID
     dataset_id = voiceover_config.DATASET_ID
     table_id = self.tmp_table_id
+    allowed_chars = frozenset(string.ascii_letters + string.digits + '_')
+    if (
+        not isinstance(table_id, str)
+        or not 1 <= len(table_id) <= 1024
+        or not set(table_id).issubset(allowed_chars)
+    ):
+      raise ValueError('invalid BigQuery table_id')
     client = voiceover_utils.bigquery.Client(project=project_id)
     query = f"""
     UPDATE `{project_id}.{dataset_id}.{table_id}`
-    SET status = '{new_status}'
-    WHERE video_id = '{self.video_id}' AND version = '{self.version}'
+    SET status = @new_status
+    WHERE video_id = @video_id AND version = @version
     """
+    job_config = voiceover_utils.bigquery.QueryJobConfig(
+        query_parameters=[
+            voiceover_utils.bigquery.ScalarQueryParameter(
+                'new_status', 'STRING', str(new_status)
+            ),
+            voiceover_utils.bigquery.ScalarQueryParameter(
+                'video_id', 'STRING', str(self.video_id)
+            ),
+            voiceover_utils.bigquery.ScalarQueryParameter(
+                'version', 'STRING', str(self.version)
+            ),
+        ]
+    )
     try:
-      query_job = client.query(query)
+      query_job = client.query(query, job_config=job_config)
       query_job.result()
       logger.info(
           "Updated status to '%s' for video_id: %s, version: %s",
@@ -697,14 +729,14 @@ class VideoVoiceover:
             string.ascii_lowercase + string.digits, k=_RANDOM_STRING_LENGTH
         )
     )
-    video_extension = video_file.split('.')[1]
+    video_extension = _extract_safe_extension(video_file)
     tmp_video_file = f'{self.tmp_path}/video_{random_string}.{video_extension}'
-    sound_extension = audio_file.split('.')[1]
+    sound_extension = _extract_safe_extension(audio_file)
     tmp_audio_file = (
         f'{self.tmp_path}/base_audio_{random_string}.{sound_extension}'
     )
     tmp_audio_file_after_vocal_removal = tmp_audio_file
-    speech_extension = speech_file.split('.')[1]
+    speech_extension = _extract_safe_extension(speech_file)
     tmp_speech_file = (
         f'{self.tmp_path}/speech_{random_string}.{speech_extension}'
     )
@@ -723,31 +755,43 @@ class VideoVoiceover:
         and self.original_video_has_vocal_dubbing == 'YES'
     ):
       logger.info('original_video_has_vocal_dubbing: YES')
-      tmp_audio_file_removed_original_vocal = f'{self.tmp_path}/base_audio_{random_string}_removed_original_vocal.{sound_extension}'
+      tmp_audio_file_removed_original_vocal = (
+          f'{self.tmp_path}/base_audio_{random_string}'
+          f'_removed_original_vocal.{sound_extension}'
+      )
       # Remove the vocals from the original video by trying to remove or
       # attenuate the center channel sound
       # ffmpeg -i input.mp4
       # -af "pan=stereo|c0=c0-c1|c1=c0-c1" -c:v copy output.mp4
-      ffmpeg_remove_original_vocal_dub_command = (
-          'ffmpeg '
-          # "-loglevel error "
-          f'-i {tmp_audio_file} '
-          '-af "pan=stereo|c0=c0-c1|c1=c0-c1" '
-          f'-c:v copy '
-          f'{tmp_audio_file_removed_original_vocal}'
-      )
+      ffmpeg_remove_original_vocal_dub_command = [
+          'ffmpeg',
+          '-i',
+          tmp_audio_file,
+          '-af',
+          'pan=stereo|c0=c0-c1|c1=c0-c1',
+          '-c:v',
+          'copy',
+          '-y',
+          tmp_audio_file_removed_original_vocal,
+      ]
       logger.info(
           'Running command to remove original vocal dub: %s',
           ffmpeg_remove_original_vocal_dub_command,
       )
       try:
-        os.system(ffmpeg_remove_original_vocal_dub_command)
+        subprocess.run(
+            ffmpeg_remove_original_vocal_dub_command,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
         logger.info('execute: %s', ffmpeg_remove_original_vocal_dub_command)
         video_path = f'{tmp_audio_file_removed_original_vocal}'
         # Upload to Google Cloud Storage
         bucket = self.gcs_client.bucket(self.gcs_bucket_name)
         blob = bucket.blob(
-            f'{self.download_path}/{self.video_id}_base_audio_removed_original_vocal.mp4'
+            f'{self.download_path}/{self.video_id}'
+            '_base_audio_removed_original_vocal.mp4'
         )
         blob.upload_from_filename(video_path)
         logger.info(
@@ -760,18 +804,22 @@ class VideoVoiceover:
         )
         logger.info('file location %s', tmp_audio_file_after_vocal_removal)
       except Exception as e:  # pylint: disable=broad-exception-caught
-        print(e)
-    ffmpeg_normalize_command = (
-        f'ffmpeg-normalize {tmp_audio_file_after_vocal_removal} '
-        f'-o {tmp_audio_file_after_vocal_removal}  -f -c:a aac '
-    )
+        self.logger.error('Failed to remove original vocal dub: %s', e)
+    ffmpeg_normalize_command = [
+        'ffmpeg-normalize',
+        tmp_audio_file_after_vocal_removal,
+        '-o',
+        tmp_audio_file_after_vocal_removal,
+        '-f',
+        '-c:a',
+        'aac',
+    ]
     self.logger.info(
         'Start executing ffmpeg-normalize command: %s', ffmpeg_normalize_command
     )
     try:
       result = subprocess.run(
           ffmpeg_normalize_command,
-          shell=True,
           check=True,
           stdout=subprocess.PIPE,
           stderr=subprocess.PIPE,
@@ -796,21 +844,43 @@ class VideoVoiceover:
         ),
         0,
     )
-    ffmpeg_mix_command = (
-        f'ffmpeg -loglevel info -progress pipe:1 -i {tmp_video_file} -i'
-        f' {tmp_audio_file_after_vocal_removal} -i'
-        f' {tmp_speech_file} -filter_complex'
-        f' "[2:a]atempo={speed_adjust},adelay={millisecond_start_audio}:all=1[voice_dub];[1:a][voice_dub]amix=inputs=2:duration=longest[audio_out]"'
-        ' -c:v copy -c:a aac -b:a 192k -map 0:v -map "[audio_out]" -y'
-        f' {tmp_generated_video_file}'
+    filter_complex = (
+        f'[2:a]atempo={speed_adjust},adelay={millisecond_start_audio}:all=1'
+        '[voice_dub];[1:a][voice_dub]amix=inputs=2:duration=longest[audio_out]'
     )
+    ffmpeg_mix_command = [
+        'ffmpeg',
+        '-loglevel',
+        'info',
+        '-progress',
+        'pipe:1',
+        '-i',
+        tmp_video_file,
+        '-i',
+        tmp_audio_file_after_vocal_removal,
+        '-i',
+        tmp_speech_file,
+        '-filter_complex',
+        filter_complex,
+        '-c:v',
+        'copy',
+        '-c:a',
+        'aac',
+        '-b:a',
+        '192k',
+        '-map',
+        '0:v',
+        '-map',
+        '[audio_out]',
+        '-y',
+        tmp_generated_video_file,
+    ]
     try:
       self.logger.info(
           'Start executing the ffmpeg command for mix: %s', ffmpeg_mix_command
       )
       result = subprocess.run(
           ffmpeg_mix_command,
-          shell=True,
           check=True,
           stdout=subprocess.PIPE,
           stderr=subprocess.PIPE,
@@ -833,8 +903,8 @@ class VideoVoiceover:
       os.remove(tmp_speech_file)
       os.remove(tmp_generated_video_file)
       if (
-          self.original_video_has_vocal_dubbing
-          and self.original_video_has_vocal_dubbing == 'YES'
+          tmp_audio_file_after_vocal_removal != tmp_audio_file
+          and os.path.exists(tmp_audio_file_after_vocal_removal)
       ):
         os.remove(tmp_audio_file_after_vocal_removal)
       return True

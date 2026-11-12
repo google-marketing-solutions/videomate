@@ -17,6 +17,7 @@
 import datetime
 import json
 import logging
+import re
 import uuid
 
 from google.api_core import exceptions
@@ -27,7 +28,6 @@ from google.oauth2 import service_account
 import gspread
 from service import voiceover_config
 import streamlit as st
-
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -44,6 +44,17 @@ SCOPES = frozenset([
 cred = service_account.Credentials.from_service_account_file(
     "YOUR_SERVICE_ACCOUNT_CREDENTIAL.json", scopes=SCOPES
 )
+
+# BigQuery table identifiers interpolated into backtick-quoted queries cannot
+# be bound as query parameters, so validate table_id strictly before building
+# SQL (https://cloud.google.com/bigquery/docs/tables#table_naming).
+_BQ_TABLE_ID_RE = re.compile(r"[A-Za-z0-9_]{1,1024}")
+
+
+def _validate_table_id(table_id: str) -> None:
+  """Validates a BigQuery table identifier before SQL interpolation."""
+  if not isinstance(table_id, str) or not _BQ_TABLE_ID_RE.fullmatch(table_id):
+    raise ValueError("invalid BigQuery table_id")
 
 
 def create_temp_table(project_id: str, dataset_id: str) -> str:
@@ -97,16 +108,26 @@ def update_temp_table(
   Raises:
     Exception: If an error occurs during table update.
   """
+  _validate_table_id(table_id)
   client = bigquery.Client(project=project_id)
   query = f"""
     INSERT INTO `{project_id}.{dataset_id}.{table_id}` (video_id, version, status)
-    VALUES ('{video_id}', '{version}', '')
+    VALUES (@video_id, @version, '')
     """
+  job_config = bigquery.QueryJobConfig(
+      query_parameters=[
+          bigquery.ScalarQueryParameter("video_id", "STRING", str(video_id)),
+          bigquery.ScalarQueryParameter("version", "STRING", str(version)),
+      ]
+  )
   try:
-    query_job = client.query(query)
+    query_job = client.query(query, job_config=job_config)
     query_job.result()
-    logging.info("Updated temporary table for video_id: %s, version: %s",
-                 video_id, version)
+    logging.info(
+        "Updated temporary table for video_id: %s, version: %s",
+        video_id,
+        version,
+    )
   except Exception as e:  # pylint: disable=broad-exception-caught
     logging.error("Error updating temporary table: %s", str(e))
 
@@ -171,6 +192,7 @@ def get_table_stats(
   Raises:
     Exception: If an error occurs during table statistics retrieval.
   """
+  _validate_table_id(table_id)
   client = bigquery.Client(project=project_id)
   total_query = f"""
     SELECT COUNT(*) as total
@@ -210,8 +232,12 @@ def display_table_results(table_id: str) -> None:
   Args:
     table_id: The ID of the BigQuery table.
   """
+  table_id = table_id.strip() if isinstance(table_id, str) else table_id
   if table_id:
-    total, processed = get_table_stats(GCP_PROJECT_ID, DATASET_ID, table_id)
+    try:
+      total, processed = get_table_stats(GCP_PROJECT_ID, DATASET_ID, table_id)
+    except ValueError:
+      total, processed = None, None
     if total is not None and processed is not None:
       st.write(f"Total data volume: {total}")
       st.write(f"Amount of data processed: {processed}")
@@ -316,25 +342,38 @@ def is_video_processed(
   """
   try:
     date_str = str(date)
-    formatted_date = datetime.datetime.strptime(
-        date_str, "%Y%m%d"
-    ).strftime("%Y-%m-%d")
+    formatted_date = datetime.datetime.strptime(date_str, "%Y%m%d").strftime(
+        "%Y-%m-%d"
+    )
   except ValueError:
     logging.error("Invalid date format: %s. Expected format: YYYYMMDD", date)
     return False
+  _validate_table_id(table_id)
   query = f"""
     SELECT COUNT(*) as count
     FROM `{project_id}.{dataset_id}.{table_id}`
-    WHERE date = DATE('{formatted_date}')
-    AND video_id = '{video_id}'
-    AND language_code = '{languagecode}'
-    AND voice_id = '{voiceid}'
+    WHERE date = DATE(@date)
+    AND video_id = @video_id
+    AND language_code = @languagecode
+    AND voice_id = @voiceid
     AND status IN ('GENERATE_SUCCESS', 'ALREADY_EXISTS')
     """
+  query_parameters = [
+      bigquery.ScalarQueryParameter("date", "STRING", formatted_date),
+      bigquery.ScalarQueryParameter("video_id", "STRING", str(video_id)),
+      bigquery.ScalarQueryParameter(
+          "languagecode", "STRING", str(languagecode)
+      ),
+      bigquery.ScalarQueryParameter("voiceid", "STRING", str(voiceid)),
+  ]
   if version:
-    query += f" AND version = '{version}'"
+    query += " AND version = @version"
+    query_parameters.append(
+        bigquery.ScalarQueryParameter("version", "STRING", str(version))
+    )
+  job_config = bigquery.QueryJobConfig(query_parameters=query_parameters)
   logging.info("query is %s", query)
-  query_job = client.query(query)
+  query_job = client.query(query, job_config=job_config)
   results = query_job.result()
   row = next(iter(results))
   return row["count"] > 0
@@ -574,7 +613,7 @@ def main():
                 TypeError,
             ) as e:
               logging.error("An error occurred during processing: %s", str(e))
-              st.error("An error occurred during processing: %s", str(e))
+              st.error(f"An error occurred during processing: {e}")
     elif page == "Processing Results Preview":
       st.subheader("Processing Results Preview")
       temp_table_id = st.text_input("Please enter temporary table ID")
@@ -582,7 +621,7 @@ def main():
         display_table_results(temp_table_id)
   except (exceptions.GoogleAPICallError, ValueError) as e:
     logging.error("Uncaught error occurred in main function: %s", str(e))
-    st.error("An error occurred: %s", str(e))
+    st.error(f"An error occurred: {e}")
 
 
 if __name__ == "__main__":
